@@ -1,310 +1,581 @@
-from functools import reduce
-from enum import Enum
+import logging
 import subprocess
 import time
 import i3ipc
+import argparse
+
+
+from typing import Dict, Optional, List, Any
+from functools import reduce
+from itertools import accumulate
+from enum import Enum
 from time import sleep
 
 
-PRESETS = {
-    "hidden1": [
-        {
-            "run": ["alacritty", "-T", "thing"],
-            "name": "thing",
-            "geometry": {"x": 0, "y": 0, "w": 200, "h": 200},
-            "scratch": "hidden1",
-        },
-    ],
-    "hidden2": [
-        {
-            "run": ["alacritty", "-T", "thing2"],
-            "name": "thing2",
-            "geometry": {"x": 250, "y": 250, "w": 200, "h": 200},
-            "scratch": "hidden2",
-        },
-    ],
-    # 
-    # 
-    #     {
-    #         "run": ["/usr/bin/bash", "/home/myo/.config/i3/watcher/script.sh"],
-    #         "name": "SystemMonitor",
-    #         "geometry": {"x": 10, "y": 10, "w": 400, "h": 1060},
-    #         "scratch": "hidden1",
-    #         # "skip_startup": False,
-    #     },
-    # "hidden2": [
-        # {
-        #     "run": ["alacritty", "-T", "newsboatterm", "-e", "newsboat"],
-        #     "name": "newsboatterm",
-        #     "geometry": {"x": 420, "y": 10, "w": 1200, "h": 353},
-        #     "scratch": "hidden2",
-        #     # "skip_startup": True,
-        # },
-        # {
-        #     "run": ["alacritty", "-T", "termusicoverlay", "-e", "termusic"],
-        #     "name": "termusicoverlay",
-        #     "geometry": {"x": 420, "y": 373, "w": 1200, "h": 696},
-        #     "scratch": "hidden2",
-        # },
-    # ],
-    # "hidden3": [
-    #     {
-    #         "run": ["alacritty", "-T", "todo", "-e", "helix", "~/Desk/todo_/todo.md"],
-    #         "name": "todo",
-    #         "geometry": {"x": 420, "y": 10, "w": 1200, "h": 1060},
-    #         "scratch": "hidden3",
-    #     },
-    # ],
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Window:
+    run: list | None  # command to run (list of arguments) or None
+    geometry: Dict[str, int]  # dict like {"x": 0, "y": 0, "w": 200, "h": 200}
+    window_name: str  # name of the window spawned from run command
+    workspace: Optional[str | int] = "w_hidden"  # home workspace
+    skip_spawn: Optional[bool] = False  # do not spawn this window. Skips spawn step
+    skip_init: Optional[bool] = False  # do not init this window (initial state snapshot, position, set mode, etc). Skips init step
+    steal_focus: Optional[bool] = False  # should this window steal focus. If multiple set in one layout, last one will steal focus
+    restore_to_initial_state: Optional[bool] = False  # if set, window will catch it current state and try to restore to this state instead of hiding
+
+    _initial_state_snapshot: Optional[Any] = None  # internal variable for initial window state to return to
+
+    def __hash__(self):
+        return hash(self.window_name)
+
+    def __eq__(self, o):
+        if not isinstance(o, Window):
+            raise ValueError("compare only with window")
+        return self.window_name == o.window_name
+
+
+@dataclass
+class Layout:
+    windows: List[Window]
+    close_layout_on: Optional[List[str]] = field(default_factory=list())
+    # layout_command: str
+
+
+# Ideally, first layout, which used to showup on empty workspaces
+# should not contain any focus stealing windows
+# because default layout is shown on workspace with floating windows as well
+# and stealing focus in this case can be annoying
+# on the other hand, sub-layouts should have focus stealing on apps, that
+# actually interactable, because it is usually expected behaviour
+
+LAYOUTS = {
+    'show_partial_overlay': Layout(
+        windows=[
+            Window(
+                run=["alacritty", "-T", "cmatrix2", "-e", "cmatrix"],
+                geometry={"x": 350, "y": 150, "w": 250, "h": 500},
+                window_name="cmatrix2",
+            ),
+            Window(
+                run=["alacritty", "-T", "cmatrix3", "-e", "cmatrix"],
+                geometry={"x": 900, "y": 300, "w": 250, "h": 500},
+                window_name="cmatrix3",
+            ),
+        ],
+        close_layout_on=[
+            'exec --no-startup-id  echo "show_partial_overlay"',
+        ]
+    ),
+    'exec --no-startup-id  echo "show_overlay_1"': Layout(
+        windows=[
+            Window(
+                run=["alacritty", "-T", "cmatrix", "-e", "cmatrix"],
+                geometry={"x": 50, "y": 50, "w": 250, "h": 500},
+                window_name="cmatrix",
+            ),
+            # Window(
+            #     run=["alacritty", "-T", "bigtime", "-e", "bigtime"],
+            #     geometry={"x": 350, "y": 50, "w": 1800, "h": 250},
+            #     window_name="bigtime",
+            #     steal_focus=True,
+            # ),
+            Window(
+                run=None,
+                geometry={"x": 350, "y": 50, "w": 1800, "h": 250},
+                window_name="special",
+                skip_spawn=True,
+                restore_to_initial_state=True,
+                workspace="21"
+            ),
+        ],
+        close_layout_on=[
+            'exec --no-startup-id  echo "show_partial_overlay"',
+            'exec --no-startup-id  echo "show_overlay_1"',
+        ]
+    ),
 }
 
+CURRENT_LAYOUT: None | Layout = None
+HIDE_ON_WORKSPACE: None | str = None
 
-# TODO: make it enum instead
-status = 0
-LAST_WORKSPACE = None
-ALL_APPS = reduce(
-    lambda x, y: x + y, PRESETS.values()
-)
-ALL_NAMES = [app['name'] for app in ALL_APPS]
-button_trigger = None
 
 i3 = i3ipc.Connection()
 
 
-# ========================================================================================
+def move_window_to_workspace(
+    i3_container: i3ipc.Con,
+    workspace: Optional[str] = None,
+):
+    if workspace == "scratchpad":
+        i3.command(f"[con_id={i3_container.id}] move to scratchpad")
+    else:
+        i3.command(f"[con_id={i3_container.id}] move to workspace {workspace}")
 
 
+def get_dimensions_on_workspace(
+    geometry: Dict[str, int],
+    workspace: i3ipc.Con,
+):
+    max_x = workspace.rect.x + workspace.rect.width
+    desired_x = geometry['x'] + workspace.rect.x
 
-def spawn(targets=None):
-    if not targets:
-        targets = PRESETS["hidden1"]
-    if not cleanup_unneded_instances(i3.get_tree()):
-        for app in targets:
-            res = subprocess.Popen(app["run"])
-            print(res)
-
-
-def cleanup_unneded_instances(
-    tree,
-    scratches=None,
-    keep=None,
-) -> bool:
-    if not scratches:
-        scratches = PRESETS.keys()
-    if not keep:
-        keep = []
-
-    scratches_to_cleanup = [PRESETS[item] for item in scratches if item not in keep]
-
-    if not scratches:
+    if desired_x >= max_x:
         return
 
-    all_apps = reduce(
-        lambda x, y: x + y, scratches
+    max_y = workspace.rect.y + workspace.rect.height
+    desired_y = geometry['y'] + workspace.rect.y
+
+    if desired_y >= max_y:
+        return
+
+    width = min(
+        geometry['w'],
+        max_x - desired_x
+    )
+    height = min(
+        geometry['h'],
+        max_y - desired_y,
     )
 
-    res = True
-    for app in all_apps:
-        matching = list(
+    if width < 100 or height < 100:
+        return
+
+
+    return {
+        "x": desired_x,
+        "y": desired_y,
+        "w": width,
+        "h": height,
+    }
+
+
+def place_window(
+    i3_container: i3ipc.Con,
+    x,
+    y,
+):
+    win_id = i3_container.id
+    i3.command(f"[con_id={win_id}] move position {x} {y}")
+
+def resize_window(
+    i3_container: i3ipc.Con,
+    w,
+    h,
+):
+    win_id = i3_container.id
+    i3.command(f"[con_id={win_id}] resize set {w} {h}")
+
+
+def float_window(
+    i3_container: i3ipc.Con,
+):
+    i3.command(f"[con_id={i3_container.id}] floating enable")
+
+
+def focus_window(
+    i3_container: i3ipc.Con,
+):
+    i3.command(f"[con_id={i3_container.id}] focus")
+
+
+def snapshot_Window(
+    i3_container: i3ipc.Con,
+):
+    rect = i3_container.rect
+
+    return {
+        "con_id": i3_container.id,
+        "workspace": i3_container.workspace().name,
+        "floating": i3_container.floating,
+        "fullscreen": i3_container.fullscreen_mode,
+        "rect": {
+            "x": rect.x,
+            "y": rect.y,
+            "w": rect.width,
+            "h": rect.height,
+        },
+    }
+
+
+def restore_Window(
+    window: Window,
+):
+    if not window.restore_to_initial_state:
+        return
+
+    state = window._initial_state_snapshot
+
+    i3.command(
+        f"[con_id={state['con_id']}] move container to workspace {state['workspace']}"
+    )
+
+    if state["floating"] not in {"user_off", "auto_off"}:
+        r = state["rect"]
+        i3.command(f"[con_id={state['con_id']}] floating enable")
+        i3.command(f"[con_id={state['con_id']}] move position {r['x']} px {r['y']} px")
+        i3.command(f"[con_id={state['con_id']}] resize set {r['w']} px {r['h']} px")
+    else:
+        i3.command(f"[con_id={state['con_id']}] floating disable")
+
+    if state["fullscreen"]:
+        i3.command(f"[con_id={state['con_id']}] fullscreen enable")
+
+
+def init_Layout(layout: Layout):
+    """set windows initial positions and sizes"""
+    tree = i3.get_tree()
+    for win in layout.windows:
+        if win.skip_init:
+            continue
+        i3_container = find_window_container(tree, win)
+        if not i3_container:
+            logging.debug(f'Container for window (window_name={win.window_name}) not found, trying to spawn it')
+            continue
+        if win.restore_to_initial_state:
+            win._initial_state_snapshot = snapshot_Window(i3_container)
+            restore_Window(win)
+            continue
+        resize_window(i3_container, win.geometry['w'], win.geometry['h'])
+        move_window_to_workspace(
+            i3_container,
+            win.workspace,
+        )
+
+
+def spawn_Layout(layout: Layout):
+    tree = i3.get_tree()
+    for win in layout.windows:
+        if win.skip_spawn:
+            continue
+        i3_container = find_window_container(tree, win)
+        if i3_container:
+            continue
+        spawn([win])
+        i3_container = find_window_container(tree, win)
+        if not i3_container:
+            logging.debug(f'Container for window (window_name={win.window_name}) either not spawned properly or disabled for spawning. Either way, it is not moved to desired workspace')
+
+
+def close_Layout(layout: Optional[Layout] = None):
+    global CURRENT_LAYOUT
+    global HIDE_ON_WORKSPACE
+
+    if not layout:
+        layout = CURRENT_LAYOUT
+
+    if not layout:
+        return
+
+    tree = i3.get_tree()
+    for win in layout.windows:
+        i3_container = find_window_container(tree, win)
+        if not i3_container:
+            logging.debug(f'Container for window (window_name={win.window_name}) not found')
+            continue
+        if win.restore_to_initial_state:
+            restore_Window(win)
+            continue
+        move_window_to_workspace(
+            i3_container,
+            win.workspace,
+        )
+
+    CURRENT_LAYOUT = None
+
+
+def open_Layout(
+    layout: Layout,
+):
+    global CURRENT_LAYOUT
+    global HIDE_ON_WORKSPACE
+
+    tree = i3.get_tree()
+    ws = tree.find_focused().workspace()
+    windows_data = list()
+    for win in layout.windows:
+        i3_container = find_window_container(tree, win)
+        if not i3_container:
+            logging.debug(f'Container for window (window_name={win.window_name}) not found')
+            continue
+        float_window(i3_container)
+        move_window_to_workspace(
+            i3_container,
+            ws.name,
+        )                
+        dimensions = get_dimensions_on_workspace(
+            win.geometry,
+            ws,
+        )
+        if not dimensions:
+            logging.debug(f'Container for window (window_name={win.window_name}) can not be fitted in workspace, hiding it')
+            move_window_to_workspace(
+                i3_container,
+                win.workspace,
+            )
+            continue
+        place_window(i3_container, dimensions["x"], dimensions["y"])
+        if win.steal_focus:
+            focus_window(i3_container)
+        windows_data.append(
+            {
+                "win": win,
+                "i3_container": i3_container,
+                "x": dimensions['x'],
+                "y": dimensions["y"],
+                "w": dimensions["w"],
+                "h": dimensions["h"],
+            }
+        )
+
+    sleep(0.005)
+    for win in windows_data:
+        resize_window(
+            win["i3_container"],
+            win['w'],
+            win['h']
+        )
+
+    CURRENT_LAYOUT = layout
+    HIDE_ON_WORKSPACE = None
+
+
+def workspace_empty(ws: i3ipc.Con):
+    """checks if all workspace empty, or have only 'floating' windows in it"""
+    for w in ws.leaves():
+        if w.floating in {"auto_off", "user_off",}:
+            return False
+    return True
+
+
+def spawn(targets: List[Window]):
+    tree = i3.get_tree()
+    for win in filter(lambda target: not find_window_container(tree, target), targets):
+        res = subprocess.Popen(win.run)
+        logging.debug(f"window spawned: {res}")
+
+
+def find_window_container(tree: i3ipc.Con, win: Window) -> i3ipc.Con | None:
+    try:
+        return next(
             filter(
-                lambda w: w.name
-                and w.name == app['name']
-                and w.workspace().name not in PRESETS.keys(),
+                lambda i3_con: i3_con.name
+                and i3_con.name == win.window_name,
                 tree.leaves(),
             )
         )
-        if len(matching) > 0:
-            for win in matching[1:]:
-                win.command("kill")
-            # float_and_resize(matching[0], app["geometry"])
-            move_to_scratchpad(matching[0], app["scratch"])
-        res = False
-    return
+    except StopIteration:
+        return None
 
 
-def float_and_resize(win, geometry):
-    win_id = win.id
-    i3.command(f"[con_id={win_id}] floating enable")
-    i3.command(f"[con_id={win_id}] resize set {geometry['w']} {geometry['h']}")
-    i3.command(f"[con_id={win_id}] move position {geometry['x']} {geometry['y']}")
+def get_layouts_window_titles() -> List[str]:
+    all_titles = set()
+    for layout in LAYOUTS.values():
+        for win in layout.windows:
+            all_titles.add(win.window_name)
+
+    return list(all_titles)
+            
 
 
-def move_to_scratchpad(win, scratch):
-    if scratch == "scratchpad":
-        i3.command(f"[con_id={win.id}] move to {scratch}")
-    else:
-        i3.command(f"[con_id={win.id}] move to workspace {scratch}")
+def get_spawn_targets(
+    layouts: List[Layout]
+) -> List[Window]:
+    """returns filtered out unique spawn targets"""
+    all_windows = reduce(
+        lambda a, b: a.windows + b.windows,
+        layouts,
+    )
+    return list(set(all_windows))
 
 
-def showup(tree, ws, show_scratches=None, focus_win=None):
-    if not show_scratches:
-        show_scratches = ["hidden1"]
-        all_apps = PRESETS["hidden1"]
-    else:
-        all_apps = reduce(
-            lambda x, y: x + y, [PRESETS[item] for item in show_scratches]
-        )
+def on_binding(i3conn, event: i3ipc.events.BindingEvent):
+    """check binding sended and try to showup windows"""
+    global CURRENT_LAYOUT
+    global HIDE_ON_WORKSPACE
 
-    if resp_if_needed(
-        tree,
-        all_apps,
-    ):
-        tree = i3.get_tree()
-    for app in all_apps:
-        # if app["skip_startup"] and not app["scratch"] == show_scratch and not FULL_OVERLAY_SPAWN:
-        #     return
-        matching = list(
-            filter(lambda w: w.name and w.name == app["name"], tree.leaves())
-        )
-        if not matching:
-            print("ERR: index out of bounds. Check apps health.")
-            return
-        win = matching[0]
-        float_and_resize(win, app["geometry"])
-        win.command(f"move container to workspace {ws.name}")
-        if focus_win == app["name"]:
-            win.command("focus")
+    tree = i3conn.get_tree()
+
+    layout_to_switch_to = LAYOUTS.get(event.binding.command)
+    if not layout_to_switch_to:
+        return
 
 
-def resp_if_needed(tree, targets):
-    dead = list(filter(lambda app: not list(filter(lambda w: w.name==app["name"], tree.leaves())), targets))
-    if dead:
-        spawn(dead)
-        sleep(0.5)
-        return True
+    if CURRENT_LAYOUT is None:
+        close_Layout()
+        spawn_Layout(layout_to_switch_to)
+        open_Layout(layout_to_switch_to)
+        return
 
+    if CURRENT_LAYOUT == layout_to_switch_to:
+        close_Layout()
+        HIDE_ON_WORKSPACE = tree.find_focused().workspace().name
+        return
 
-# ========================================================================================
+    if event.binding.command in CURRENT_LAYOUT.close_layout_on:
+        close_Layout()
+        HIDE_ON_WORKSPACE = tree.find_focused().workspace().name
+        return
 
+    close_Layout()
+    open_Layout(layout_to_switch_to)
 
-def on_binding(i3conn, event):
-    global status, button_trigger
-    # 
-    # when workpace focused, button_trigger sets to None
-
-    print('~~~~~~~~~~``')
-    print(event.binding.command)
-    print(status)
-    print(button_trigger)
-    print('~~~~~~~~~~``')
-    match event.binding.command:
-
-        case 'exec --no-startup-id  echo "show_partial_overlay"':
-            if status != 0:
-                cleanup_unneded_instances(i3.get_tree())
-                status = 0
-                button_trigger = True
-            else:
-                status = 1
-                cleanup_unneded_instances(i3conn.get_tree(), None, ["hidden1"])
-                ws = i3.get_tree().find_focused().workspace()
-                showup(i3.get_tree(), ws, ["hidden1"], focus_win="thing")
-                button_trigger = True
-
-        case 'exec --no-startup-id  echo "show_overlay_1"':
-            if status == 2:
-                # cleanup status (current thing opened)
-                status = 0
-                cleanup_unneded_instances(i3.get_tree(), ["hidden1", "hidden2"])
-                button_trigger = True
-            else:
-                if status != 0:
-                    cleanup_unneded_instances(i3conn.get_tree(), None, ["hidden1", "hidden2"])
-                status = 2
-                ws = i3.get_tree().find_focused().workspace()
-                showup(i3.get_tree(), ws, ["hidden1", "hidden2"], "thing2")
-                button_trigger = True
-
-        # case 'exec --no-startup-id  echo "show_overlay_2"':
-        #     if status == 3:
-        #         status = 0
-        #         cleanup_unneded_instances(i3.get_tree(), ["hidden1", "hidden3"])
-        #         button_trigger = True
-        #     else:
-        #         if status != 0:
-        #             cleanup_unneded_instances(i3conn.get_tree(), None, ["hidden1", "hidden3"])
-        #         status = 3
-        #         ws = i3.get_tree().find_focused().workspace()
-        #         showup(i3.get_tree(), ws, ["hidden1", "hidden3"], "todo")
-        #         button_trigger = True
 
 i3.on("binding", on_binding)
 
 
-def on_window_close(i3conn, event):
-    global status
-    win = event.container
-    if not win.name or not win.name in ALL_NAMES:
-        ws = i3.get_tree().find_focused().workspace()
-        if status == 0 and not ws.nodes:
-            showup(i3.get_tree(), ws, ["hidden1"])
-            status = 1
-    resp_if_needed(i3conn.get_tree(), ALL_APPS)
-    # if not cleanup_unneded_instances(i3.get_tree()):
-    #     spawn()
-    #     return
+def on_workspace_focus(i3conn: i3ipc.Connection, event: i3ipc.events.IpcBaseEvent):
+    global HIDE_ON_WORKSPACE
 
-i3.on("window::close", on_window_close)
+    tree = i3conn.get_tree()
+    focus_workspace = tree.find_focused().workspace()
 
-
-
-def on_workspace_focus(i3conn, event):
-    global LAST_WORKSPACE, status, button_trigger
-    ws = event.current
-    if ws is None:
+    current_layout_workspace_is_empty = (
+        CURRENT_LAYOUT
+        and next((find_window_container(tree, win) for win in CURRENT_LAYOUT.windows), None)
+        and workspace_empty(next((find_window_container(tree, win) for win in CURRENT_LAYOUT.windows), None).workspace())
+    )
+    if current_layout_workspace_is_empty and not workspace_empty(focus_workspace):
         return
-    if button_trigger and LAST_WORKSPACE == ws.name:
-        button_trigger = None
-        LAST_WORKSPACE = ws.name
+
+    focus_on_same_workspace_as_current_layout = (
+        CURRENT_LAYOUT
+        and next((find_window_container(tree, win) for win in CURRENT_LAYOUT.windows), None)
+        and focus_workspace.name == next((find_window_container(tree, win) for win in CURRENT_LAYOUT.windows), None).workspace().name
+    )
+    if focus_on_same_workspace_as_current_layout:
+        # skip re-focus on the current layout
         return
-    if (
-        not ws.nodes
-        and LAST_WORKSPACE != ws.name
-    ):
-        showup(i3.get_tree(), ws, ["hidden1"])
-        status = 1
-    else:
-        cleanup_unneded_instances(i3.get_tree())
-        status = 0
-    LAST_WORKSPACE = ws.name
-    
+
+    hide_button_pressed_on_current_workspace = focus_workspace.name == HIDE_ON_WORKSPACE
+    if hide_button_pressed_on_current_workspace:
+        return
+
+    if workspace_empty(focus_workspace):
+        close_Layout()
+        default_layout = list(LAYOUTS.values())[0]
+        spawn_Layout(default_layout)
+        open_Layout(default_layout)
+        return
+
+    close_Layout()
+
 i3.on("workspace::focus", on_workspace_focus)
 
 
-def on_new_windnow(i3conn, event):
-    global status
-    win = event.container
-    if win.name and win.name in ALL_NAMES:
-        if cleanup_unneded_instances(i3.get_tree()):
-            return
-    if status == 0:
+def default_behavior(i3conn, event: i3ipc.events.IpcBaseEvent):
+    tree = i3conn.get_tree()
+    focus_workspace = tree.find_focused().workspace()
+
+    if event.container.window_title in get_layouts_window_titles():
         return
-    ws = win.workspace()
-    if ws and ws.nodes:
-        status = 0
-        return cleanup_unneded_instances(i3.get_tree())
-    if win.floating != "user_on" and win.floating != "auto_on":
-        status = 0
-        return cleanup_unneded_instances(i3.get_tree())
+    focus_on_same_workspace_as_current_layout = (
+        CURRENT_LAYOUT
+        and next((find_window_container(tree, win) for win in CURRENT_LAYOUT.windows), None)
+        and focus_workspace.name == next((find_window_container(tree, win) for win in CURRENT_LAYOUT.windows), None).workspace().name
+    )
+    if focus_on_same_workspace_as_current_layout and workspace_empty(focus_workspace):
+        return
+    elif focus_on_same_workspace_as_current_layout and not workspace_empty(focus_workspace):
+        close_Layout()
+        return
 
-i3.on("window::new", on_new_windnow)
-
-
-def on_window_floating(i3conn, event):
-    win = event.container
-    ws = i3.get_tree().find_focused().workspace()
-    if ws and ws.nodes:
-        cleanup_unneded_instances(i3.get_tree())
-    elif win.floating == "user_on":
-        showup(i3.get_tree(), ws)
+    if workspace_empty(focus_workspace):
+        default_layout = list(LAYOUTS.values())[0]
+        spawn_Layout(default_layout)
+        open_Layout(default_layout)
     else:
-        cleanup_unneded_instances(i3.get_tree())
+        close_Layout()
 
-i3.on("window::floating", on_window_floating)
 
- 
-# ========================================================================================
+i3.on("window::new", default_behavior)
+i3.on("window::floating", default_behavior)
 
-spawn(
-    ALL_APPS
-)
-i3.main()
+
+def on_close(i3conn, event: i3ipc.events.WindowEvent):
+    closed_window = event.container
+    tree = i3conn.get_tree()
+    focus_workspace = tree.find_focused().workspace()
+
+    focus_on_same_workspace_as_current_layout = (
+        CURRENT_LAYOUT
+        and next((find_window_container(tree, win) for win in CURRENT_LAYOUT.windows), None)
+        and focus_workspace.name == next((find_window_container(tree, win) for win in CURRENT_LAYOUT.windows), None).workspace().name
+    )
+    if focus_on_same_workspace_as_current_layout and workspace_empty(focus_workspace):
+        return
+
+    if closed_window.window_title in get_layouts_window_titles():
+        return
+    if workspace_empty(focus_workspace):
+        default_layout = list(LAYOUTS.values())[0]
+        spawn_Layout(default_layout)
+        open_Layout(default_layout)
+    else:
+        close_Layout()
+
+i3.on("window::close", on_close)
+
+
+
+def parse_loglevel(loglevel: str):
+    map = {
+        "debug": logging.DEBUG,
+        "info": logging.INFO,
+        "warning": logging.WARNING,
+        "error": logging.ERROR,
+    }
+    return map.get(loglevel, logging.INFO)
+
+
+def get_cli_args():
+    parser = argparse.ArgumentParser(
+        prog="Manage and use floating sub-layouts with i3.",
+        description=(
+            "Manage floating overlay layouts in i3wm. "
+            "The script listens to i3 IPC events and keybindings to automatically "
+            "spawn, position, float, hide, and restore predefined windows. "
+            "Layouts appear on empty workspaces or when triggered, and disappear "
+            "when focus or workspace state changes."
+        )
+    )
+
+    parser.add_argument(
+        "--log-level",
+        dest="log_level",
+        choices=[
+            "debug",
+            "info",
+            "warning",
+            "error",
+        ],
+        default="warning",
+    )
+
+    return parser.parse_args()
+
+
+def main():
+    args = get_cli_args()
+
+    logging.basicConfig(level=parse_loglevel(args.log_level))
+
+    spawn(
+        get_spawn_targets(
+            LAYOUTS.values(),
+        )
+    )
+
+    sleep(1)
+
+    for layout in LAYOUTS.values():
+        spawn_Layout(layout)
+        init_Layout(layout)
+
+    i3.main()
+
+
+if __name__ == "__main__":
+    main()

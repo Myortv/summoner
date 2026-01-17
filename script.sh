@@ -1,2 +1,2 @@
-source ~/watcher/venv/bin/activate
-exec python ~/watcher/main.py
+source venv/bin/activate
+python watcher.py
