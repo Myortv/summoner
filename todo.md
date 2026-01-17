@@ -1,2 +1,1 @@
 - [ ] refactoring (code is very shit, it's 7:22, i want to go to sleep, i had work to do instead of this...)
-- [ ] documentation

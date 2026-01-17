@@ -52,48 +52,70 @@ class Layout:
 # actually interactable, because it is usually expected behaviour
 
 LAYOUTS = {
-    'show_partial_overlay': Layout(
+    'exec --no-startup-id  echo "show_system_monitor"': Layout(
         windows=[
             Window(
-                run=["alacritty", "-T", "cmatrix2", "-e", "cmatrix"],
-                geometry={"x": 350, "y": 150, "w": 250, "h": 500},
-                window_name="cmatrix2",
+                run=["/home/myo/sources/system_monitor/run.sh"],
+                geometry={"x": 50, "y": 50, "w": 400, "h": 1000},
+                window_name="SystemMonitor",
             ),
             Window(
-                run=["alacritty", "-T", "cmatrix3", "-e", "cmatrix"],
-                geometry={"x": 900, "y": 300, "w": 250, "h": 500},
-                window_name="cmatrix3",
+                run=["alacritty", "-T", "w_todo", "-e", "todo_output.sh", "/home/myo/Desk/todo_/todo.md", "22"],
+                geometry={"x": 500, "y": 50, "w": 900, "h": 350},
+                window_name="w_todo",
             ),
         ],
         close_layout_on=[
-            'exec --no-startup-id  echo "show_partial_overlay"',
+            'exec --no-startup-id  echo "show_system_monitor"',
         ]
     ),
-    'exec --no-startup-id  echo "show_overlay_1"': Layout(
+    'exec --no-startup-id  echo "show_newsboat"': Layout(
         windows=[
             Window(
-                run=["alacritty", "-T", "cmatrix", "-e", "cmatrix"],
-                geometry={"x": 50, "y": 50, "w": 250, "h": 500},
-                window_name="cmatrix",
+                run=["/home/myo/sources/system_monitor/run.sh"],
+                geometry={"x": 50, "y": 50, "w": 400, "h": 1000},
+                window_name="SystemMonitor",
             ),
-            # Window(
-            #     run=["alacritty", "-T", "bigtime", "-e", "bigtime"],
-            #     geometry={"x": 350, "y": 50, "w": 1800, "h": 250},
-            #     window_name="bigtime",
-            #     steal_focus=True,
-            # ),
             Window(
-                run=None,
-                geometry={"x": 350, "y": 50, "w": 1800, "h": 250},
-                window_name="special",
-                skip_spawn=True,
-                restore_to_initial_state=True,
-                workspace="21"
+                run=["alacritty", "-T", "w_todo_short", "-e", "todo_output.sh", "/home/myo/Desk/todo_/todo.md", "3"],
+                geometry={"x": 500, "y": 50, "w": 1100, "h": 100},
+                window_name="w_todo_short",
+            ),
+            Window(
+                run=["alacritty", "-T", "w_newsboat", "-e", "newsboat"],
+                geometry={"x": 500, "y": 175, "w": 1100, "h": 350},
+                window_name="w_newsboat",
+            ),
+            Window(
+                run=["alacritty", "-T", "w_termusic", "-e", "termusic"],
+                geometry={"x": 500, "y": 550, "w": 1100, "h": 500},
+                window_name="w_termusic",
+                steal_focus=True,
             ),
         ],
         close_layout_on=[
-            'exec --no-startup-id  echo "show_partial_overlay"',
-            'exec --no-startup-id  echo "show_overlay_1"',
+            'exec --no-startup-id  echo "show_newsboat"',
+            # 'exec --no-startup-id  echo "show_system_monitor"',
+        ]
+    ),
+    'exec --no-startup-id  echo "show_todo"': Layout(
+        windows=[
+            Window(
+                run=["/home/myo/sources/system_monitor/run.sh"],
+                geometry={"x": 50, "y": 50, "w": 400, "h": 1000},
+                window_name="SystemMonitor",
+            ),
+            
+            Window(
+                run=["alacritty", "-T", "w_todo_edit", "-e", "helix", "/home/myo/Desk/todo_/todo.md"],
+                geometry={"x": 500, "y": 50, "w": 1300, "h": 1000},
+                window_name="w_todo_edit",
+                steal_focus=True,
+            ),
+        ],
+        close_layout_on=[
+            'exec --no-startup-id  echo "show_todo"',
+            # 'exec --no-startup-id  echo "show_system_monitor"',
         ]
     ),
 }
@@ -353,8 +375,9 @@ def workspace_empty(ws: i3ipc.Con):
 def spawn(targets: List[Window]):
     tree = i3.get_tree()
     for win in filter(lambda target: not find_window_container(tree, target), targets):
-        res = subprocess.Popen(win.run)
-        logging.debug(f"window spawned: {res}")
+        if win.run:
+            res = subprocess.Popen(win.run)
+            logging.debug(f"window spawned: {res}")
 
 
 def find_window_container(tree: i3ipc.Con, win: Window) -> i3ipc.Con | None:
@@ -385,8 +408,9 @@ def get_spawn_targets(
 ) -> List[Window]:
     """returns filtered out unique spawn targets"""
     all_windows = reduce(
-        lambda a, b: a.windows + b.windows,
+        lambda a, b: a + b.windows,
         layouts,
+        list(),
     )
     return list(set(all_windows))
 
@@ -539,6 +563,13 @@ def get_cli_args():
             "spawn, position, float, hide, and restore predefined windows. "
             "Layouts appear on empty workspaces or when triggered, and disappear "
             "when focus or workspace state changes."
+            "\n"
+            "Edit `LAYOUTS` variable inside of this script, to modify layouts.\n"
+            "To make keybindings accessable, add bindsym strings like this:\n"
+            'bindsym --release $mod+Ctrl+y exec --no-startup-id  echo "show_system_monitor"\n'
+            'Then, use `exec --no-startup-id  echo "show_system_monitor"\n` as key in `LAYOUTS` variable\n'
+            "Value should be valid Layout value.\n\n"
+            "You can find more in README.md"
         )
     )
 
