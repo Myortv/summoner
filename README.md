@@ -29,6 +29,11 @@ python -m venv venv
 . ./venv/bin/activate
 pip install -r req.txt
 ```
+or you can install dependency with your package manager: 
+
+```bash
+sudo pacman -S python-i3ipc
+```
 
 To run script, you'll need your envrinment activated. You can either do:
 ```bash
@@ -75,7 +80,9 @@ LAYOUTS = {
         ]
     ),
 ```
-|---|---|
+
+| arg | meaning |
+| --- | --- | 
 |`run`|  Either None (explicitly) or list of cli args to run |
 | `geometry` |  dict in format {"x": 0, "y": 0, "w": 0, "h": 0}, where `x`, `y` is top left of your workspace (output) `w` is window width and `h` is window height. Note that window should be at least 100/100 in size, or window will be counted as too small and not displayed (it still will be spawned) |
 | `window_name` | name of the window. Note that it should be unique, and you need to either set it in `run` somewhere, depending on what you run, or by hand, when you run with `skip_spawn` |
@@ -205,7 +212,10 @@ Summoner supports multihead (tho, only tested in 2 monitor setup by me). General
 
 
 # Contribution
-This repo does not accepts contributions outright. If you want to contribute, hit me up on discord (@myortv) or email (myortv@proton.me) (email is worse, i rarely check it) and i'll either merge your patches or give you access to git ssh.
+This repo does not accepts contributions outright and initially hosted at git.myortv.org/summoner.git. If you want to contribute, hit me up on discord (@myortv) or email (myortv@proton.me) (email is worse, i rarely check it) and i'll either merge your patches or give you access to git ssh.
+
 If you found any bugs, hit me up on discord (@myortv) or email (myortv@proton.me)
+
 If you have any feature requests, hit me up on discord (@myortv) or email (myortv@proton.me)
-If you are hop femboy in my area, hit me up on discord (@myortv) or email (myortv@proton.me)
+
+If you are hot femboy in my area, hit me up on discord (@myortv) or email (myortv@proton.me)
